@@ -1,4 +1,4 @@
-from datetime import time, timedelta
+from datetime import date, time, timedelta
 
 from django.core.exceptions import ValidationError
 from django.db import IntegrityError, transaction
@@ -8,7 +8,9 @@ from accounts.models import User
 from organizations.models import Organization
 
 from .models import (
+    Availability,
     EmployeeProfile,
+    LeaveRequest,
     ShiftRequirement,
     ShiftType,
     Skill,
@@ -152,3 +154,125 @@ class ShiftRequirementTests(TestCase):
         )
         with self.assertRaises(ValidationError):
             item.full_clean()            
+
+
+def make_employee(org, phone, role=User.Role.EMPLOYEE):
+    user = User.objects.create_user(
+        phone=phone, password="Str0ng-pass-123", organization=org, role=role
+    )
+    return EmployeeProfile.objects.create(organization=org, user=user)
+
+
+class AvailabilityTests(TestCase):
+    def setUp(self):
+        self.org = Organization.objects.create(name="Org")
+        self.other = Organization.objects.create(name="Other")
+        self.employee = make_employee(self.org, "09120000001")
+        self.foreign_employee = make_employee(self.other, "09120000002")
+
+    def test_default_kind_is_available(self):
+        window = Availability.objects.create(
+            organization=self.org, employee=self.employee,
+            weekday=Weekday.MONDAY, start_time=time(9, 0), end_time=time(13, 0),
+        )
+        self.assertEqual(window.kind, Availability.Kind.AVAILABLE)
+        self.assertFalse(window.crosses_midnight)
+
+    def test_overnight_window(self):
+        window = Availability(
+            organization=self.org, employee=self.employee,
+            weekday=Weekday.FRIDAY, start_time=time(22, 0), end_time=time(6, 0),
+            kind=Availability.Kind.UNAVAILABLE,
+        )
+        self.assertTrue(window.crosses_midnight)
+
+    def test_start_and_end_cannot_be_equal(self):
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            Availability.objects.create(
+                organization=self.org, employee=self.employee,
+                weekday=Weekday.MONDAY, start_time=time(9, 0), end_time=time(9, 0),
+            )
+
+    def test_employee_from_another_organization_is_invalid(self):
+        window = Availability(
+            organization=self.org, employee=self.foreign_employee,
+            weekday=Weekday.MONDAY, start_time=time(9, 0), end_time=time(13, 0),
+        )
+        with self.assertRaises(ValidationError):
+            window.full_clean()
+
+
+class LeaveRequestTests(TestCase):
+    def setUp(self):
+        self.org = Organization.objects.create(name="Org")
+        self.other = Organization.objects.create(name="Other")
+        self.employee = make_employee(self.org, "09120000001")
+        self.manager = User.objects.create_user(
+            phone="09120000003", password="Str0ng-pass-123",
+            organization=self.org, role=User.Role.OWNER,
+        )
+        self.foreign_manager = User.objects.create_user(
+            phone="09120000004", password="Str0ng-pass-123",
+            organization=self.other, role=User.Role.OWNER,
+        )
+
+    def make_leave(self, start=date(2026, 11, 10), end=date(2026, 11, 12), **extra):
+        return LeaveRequest.objects.create(
+            organization=self.org, employee=self.employee,
+            start_date=start, end_date=end, **extra,
+        )
+
+    def test_defaults_and_days(self):
+        leave = self.make_leave()
+        self.assertEqual(leave.status, LeaveRequest.Status.PENDING)
+        self.assertEqual(leave.days, 3)
+
+    def test_end_before_start_is_rejected(self):
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            self.make_leave(start=date(2026, 11, 12), end=date(2026, 11, 10))
+
+    def test_approve_records_reviewer_and_time(self):
+        leave = self.make_leave()
+        leave.approve(self.manager)
+        leave.refresh_from_db()
+        self.assertEqual(leave.status, LeaveRequest.Status.APPROVED)
+        self.assertEqual(leave.reviewed_by, self.manager)
+        self.assertIsNotNone(leave.reviewed_at)
+
+    def test_reject(self):
+        leave = self.make_leave()
+        leave.reject(self.manager)
+        self.assertEqual(leave.status, LeaveRequest.Status.REJECTED)
+
+    def test_cannot_review_twice(self):
+        leave = self.make_leave()
+        leave.approve(self.manager)
+        with self.assertRaises(ValidationError):
+            leave.reject(self.manager)
+
+    def test_reviewer_from_another_organization_is_rejected(self):
+        leave = self.make_leave()
+        with self.assertRaises(ValidationError):
+            leave.approve(self.foreign_manager)
+        leave.refresh_from_db()
+        self.assertEqual(leave.status, LeaveRequest.Status.PENDING)
+
+    def test_employee_from_another_organization_is_invalid(self):
+        foreign_employee = make_employee(self.other, "09120000005")
+        leave = LeaveRequest(
+            organization=self.org, employee=foreign_employee,
+            start_date=date(2026, 11, 10), end_date=date(2026, 11, 11),
+        )
+        with self.assertRaises(ValidationError):
+            leave.full_clean()
+
+    def test_approved_and_covering_queryset(self):
+        approved = self.make_leave()
+        approved.approve(self.manager)
+        self.make_leave(start=date(2026, 11, 11), end=date(2026, 11, 11))  # pending
+        qs = LeaveRequest.objects.for_organization(self.org).approved().covering(date(2026, 11, 11))
+        self.assertEqual(list(qs), [approved])
+        self.assertEqual(
+            LeaveRequest.objects.for_organization(self.org).approved().covering(date(2026, 11, 20)).count(),
+            0,
+        )            

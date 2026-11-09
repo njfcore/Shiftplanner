@@ -4,9 +4,10 @@ from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.core.validators import MinValueValidator
 from django.db import models
+from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 
-from organizations.models import TenantModel
+from organizations.models import TenantModel, TenantQuerySet
 
 
 class Skill(TenantModel):
@@ -225,3 +226,142 @@ class SkillRequirement(models.Model):
             raise ValidationError(
                 {"min_count": _("Cannot exceed the total required staff of the shift.")}
             )    
+
+
+class Availability(TenantModel):
+    """A weekly time window in which an employee can or cannot work."""
+
+    class Kind(models.TextChoices):
+        AVAILABLE = "available", _("Available")
+        UNAVAILABLE = "unavailable", _("Unavailable")
+
+    employee = models.ForeignKey(
+        EmployeeProfile,
+        on_delete=models.CASCADE,
+        related_name="availabilities",
+        verbose_name=_("employee"),
+    )
+    weekday = models.PositiveSmallIntegerField(_("weekday"), choices=Weekday.choices)
+    start_time = models.TimeField(_("start time"))
+    end_time = models.TimeField(_("end time"))
+    kind = models.CharField(
+        _("kind"), max_length=12, choices=Kind.choices, default=Kind.AVAILABLE
+    )
+
+    class Meta:
+        verbose_name = _("availability")
+        verbose_name_plural = _("availabilities")
+        ordering = ["employee", "weekday", "start_time"]
+        constraints = [
+            models.CheckConstraint(
+                condition=~models.Q(start_time=models.F("end_time")),
+                name="availability_start_differs_from_end",
+            ),
+        ]
+
+    def __str__(self):
+        return (
+            f"{self.employee} / {self.get_weekday_display()} "
+            f"{self.start_time:%H:%M}-{self.end_time:%H:%M} ({self.get_kind_display()})"
+        )
+
+    @property
+    def crosses_midnight(self):
+        return self.end_time < self.start_time
+
+    def clean(self):
+        super().clean()
+        employee = getattr(self, "employee", None)
+        if employee is not None and self.organization_id:
+            if employee.organization_id != self.organization_id:
+                raise ValidationError(
+                    {"employee": _("The employee must belong to the same organization.")}
+                )
+
+
+class LeaveQuerySet(TenantQuerySet):
+    def approved(self):
+        return self.filter(status=LeaveRequest.Status.APPROVED)
+
+    def covering(self, day):
+        """Leave requests whose date range includes the given day."""
+        return self.filter(start_date__lte=day, end_date__gte=day)
+
+
+class LeaveRequest(TenantModel):
+    """A leave request of an employee, reviewed by a manager."""
+
+    class Status(models.TextChoices):
+        PENDING = "pending", _("Pending")
+        APPROVED = "approved", _("Approved")
+        REJECTED = "rejected", _("Rejected")
+        CANCELLED = "cancelled", _("Cancelled")
+
+    employee = models.ForeignKey(
+        EmployeeProfile,
+        on_delete=models.CASCADE,
+        related_name="leave_requests",
+        verbose_name=_("employee"),
+    )
+    start_date = models.DateField(_("start date"))
+    end_date = models.DateField(_("end date"))
+    reason = models.TextField(_("reason"), blank=True)
+    status = models.CharField(
+        _("status"), max_length=10, choices=Status.choices, default=Status.PENDING
+    )
+    reviewed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="reviewed_leave_requests",
+        verbose_name=_("reviewed by"),
+    )
+    reviewed_at = models.DateTimeField(_("reviewed at"), null=True, blank=True)
+    created_at = models.DateTimeField(_("created at"), auto_now_add=True)
+
+    objects = LeaveQuerySet.as_manager()
+
+    class Meta:
+        verbose_name = _("leave request")
+        verbose_name_plural = _("leave requests")
+        ordering = ["-start_date"]
+        constraints = [
+            models.CheckConstraint(
+                condition=models.Q(end_date__gte=models.F("start_date")),
+                name="leave_end_not_before_start",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.employee}: {self.start_date} - {self.end_date} ({self.get_status_display()})"
+
+    @property
+    def days(self):
+        return (self.end_date - self.start_date).days + 1
+
+    def clean(self):
+        super().clean()
+        employee = getattr(self, "employee", None)
+        if employee is not None and self.organization_id:
+            if employee.organization_id != self.organization_id:
+                raise ValidationError(
+                    {"employee": _("The employee must belong to the same organization.")}
+                )
+
+    def _review(self, reviewer, new_status):
+        if self.status != self.Status.PENDING:
+            raise ValidationError(_("Only pending requests can be reviewed."))
+        if reviewer.organization_id != self.organization_id:
+            raise ValidationError(_("The reviewer must belong to the same organization."))
+        self.status = new_status
+        self.reviewed_by = reviewer
+        self.reviewed_at = timezone.now()
+        self.save()
+
+    def approve(self, reviewer):
+        self._review(reviewer, self.Status.APPROVED)
+
+    def reject(self, reviewer):
+        self._review(reviewer, self.Status.REJECTED)
+        
