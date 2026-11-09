@@ -25,6 +25,7 @@ class Organization(models.Model):
             self.slug = uuid.uuid4().hex[:12]
         super().save(*args, **kwargs)
 
+
 class TenantQuerySet(models.QuerySet):
     def for_organization(self, organization):
         """Return only the rows that belong to the given organization."""
