@@ -1,7 +1,8 @@
-from datetime import date, time, timedelta
+from datetime import date, datetime, time, timedelta
 
 from django.core.exceptions import ValidationError
 from django.db import IntegrityError, transaction
+from django.db.models import RestrictedError
 from django.test import TestCase
 
 from accounts.models import User
@@ -11,10 +12,13 @@ from .models import (
     Availability,
     EmployeeProfile,
     LeaveRequest,
+    Schedule,
+    ShiftAssignment,
     ShiftRequirement,
     ShiftType,
     Skill,
     SkillRequirement,
+    UnfilledSlot,
     Weekday,
 )
 
@@ -276,3 +280,138 @@ class LeaveRequestTests(TestCase):
             LeaveRequest.objects.for_organization(self.org).approved().covering(date(2026, 11, 20)).count(),
             0,
         )            
+
+
+class ScheduleTests(TestCase):
+    def setUp(self):
+        self.org = Organization.objects.create(name="Org")
+        self.other = Organization.objects.create(name="Other")
+
+    def test_days_and_dates(self):
+        schedule = Schedule.objects.create(
+            organization=self.org, start_date=date(2026, 11, 14), end_date=date(2026, 11, 20)
+        )
+        self.assertEqual(schedule.days, 7)
+        self.assertEqual(schedule.dates()[0], date(2026, 11, 14))
+        self.assertEqual(schedule.dates()[-1], date(2026, 11, 20))
+        self.assertEqual(schedule.status, Schedule.Status.DRAFT)
+
+    def test_end_before_start_is_rejected(self):
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            Schedule.objects.create(
+                organization=self.org, start_date=date(2026, 11, 20), end_date=date(2026, 11, 14)
+            )
+
+    def test_creator_from_another_organization_is_invalid(self):
+        foreign_user = User.objects.create_user(
+            phone="09120000009", password="Str0ng-pass-123", organization=self.other
+        )
+        schedule = Schedule(
+            organization=self.org, start_date=date(2026, 11, 14),
+            end_date=date(2026, 11, 20), created_by=foreign_user,
+        )
+        with self.assertRaises(ValidationError):
+            schedule.full_clean()
+
+
+class ShiftAssignmentTests(TestCase):
+    def setUp(self):
+        self.org = Organization.objects.create(name="Org")
+        self.other = Organization.objects.create(name="Other")
+        self.employee = make_employee(self.org, "09120000001")
+        self.foreign_employee = make_employee(self.other, "09120000002")
+        self.morning = ShiftType.objects.create(
+            organization=self.org, name="Morning",
+            start_time=time(8, 0), end_time=time(16, 0),
+        )
+        self.night = ShiftType.objects.create(
+            organization=self.org, name="Night",
+            start_time=time(22, 0), end_time=time(6, 0), is_night=True,
+        )
+        self.schedule = Schedule.objects.create(
+            organization=self.org, start_date=date(2026, 11, 14), end_date=date(2026, 11, 20)
+        )
+
+    def assign(self, day=date(2026, 11, 14), shift=None, employee=None):
+        return ShiftAssignment.objects.create(
+            organization=self.org, schedule=self.schedule,
+            employee=employee or self.employee,
+            shift_type=shift or self.morning, date=day,
+        )
+
+    def test_one_shift_per_employee_per_day(self):
+        self.assign()
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            self.assign(shift=self.night)
+
+    def test_date_outside_schedule_is_invalid(self):
+        item = ShiftAssignment(
+            organization=self.org, schedule=self.schedule, employee=self.employee,
+            shift_type=self.morning, date=date(2026, 11, 25),
+        )
+        with self.assertRaises(ValidationError):
+            item.full_clean()
+
+    def test_employee_from_another_organization_is_invalid(self):
+        item = ShiftAssignment(
+            organization=self.org, schedule=self.schedule, employee=self.foreign_employee,
+            shift_type=self.morning, date=date(2026, 11, 14),
+        )
+        with self.assertRaises(ValidationError):
+            item.full_clean()
+
+    def test_overnight_assignment_times(self):
+        item = self.assign(shift=self.night)
+        self.assertEqual(item.start_at, datetime(2026, 11, 14, 22, 0))
+        self.assertEqual(item.end_at, datetime(2026, 11, 15, 6, 0))
+        self.assertEqual(item.hours, 8)
+
+    def test_shift_type_with_assignments_cannot_be_deleted(self):
+        self.assign()
+        with self.assertRaises(RestrictedError):
+            self.morning.delete()
+
+    def test_deleting_organization_removes_everything(self):
+        self.assign()
+        self.org.delete()
+        self.assertEqual(ShiftAssignment.objects.count(), 0)
+
+
+class UnfilledSlotTests(TestCase):
+    def setUp(self):
+        self.org = Organization.objects.create(name="Org")
+        self.other = Organization.objects.create(name="Other")
+        self.shift = ShiftType.objects.create(
+            organization=self.org, name="Night",
+            start_time=time(22, 0), end_time=time(6, 0), is_night=True,
+        )
+        self.cashier = Skill.objects.create(organization=self.org, name="Cashier")
+        self.foreign_skill = Skill.objects.create(organization=self.other, name="Nurse")
+        self.schedule = Schedule.objects.create(
+            organization=self.org, start_date=date(2026, 11, 14), end_date=date(2026, 11, 20)
+        )
+
+    def test_valid_unfilled_slot(self):
+        slot = UnfilledSlot(
+            organization=self.org, schedule=self.schedule, date=date(2026, 11, 16),
+            shift_type=self.shift, skill=self.cashier, missing_count=1,
+            reason="Everyone with this skill is on leave.",
+        )
+        slot.full_clean()
+        slot.save()
+        self.assertEqual(self.schedule.unfilled_slots.count(), 1)
+
+    def test_missing_count_must_be_positive(self):
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            UnfilledSlot.objects.create(
+                organization=self.org, schedule=self.schedule, date=date(2026, 11, 16),
+                shift_type=self.shift, missing_count=0,
+            )
+
+    def test_skill_from_another_organization_is_invalid(self):
+        slot = UnfilledSlot(
+            organization=self.org, schedule=self.schedule, date=date(2026, 11, 16),
+            shift_type=self.shift, skill=self.foreign_skill, missing_count=1,
+        )
+        with self.assertRaises(ValidationError):
+            slot.full_clean()  
