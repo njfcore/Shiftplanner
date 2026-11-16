@@ -1,0 +1,196 @@
+from datetime import date, time
+
+from django.test import SimpleTestCase
+
+from .solver import (
+    EmployeeInfo,
+    Problem,
+    Requirement,
+    ShiftInfo,
+    solve,
+    week_start,
+)
+
+MORNING = ShiftInfo(1, "Morning", time(8, 0), time(16, 0))
+EVENING = ShiftInfo(2, "Evening", time(16, 0), time(23, 0))
+NIGHT = ShiftInfo(3, "Night", time(22, 0), time(6, 0), is_night=True)
+
+SAT = date(2026, 11, 14)
+SUN = date(2026, 11, 15)
+MON = date(2026, 11, 16)
+NEXT_SAT = date(2026, 11, 21)
+FRI = date(2026, 11, 20)
+
+CASHIER = 10
+
+
+def make_employees(count, **kwargs):
+    return [EmployeeInfo(id=i, name=f"E{i}", **kwargs) for i in range(1, count + 1)]
+
+
+def total_missing(solution):
+    return sum(s.missing_count for s in solution.shortages)
+
+
+class WeekStartTests(SimpleTestCase):
+    def test_saturday_starts_the_week(self):
+        self.assertEqual(week_start(SAT), SAT)
+        self.assertEqual(week_start(SUN), SAT)
+        self.assertEqual(week_start(FRI), SAT)
+        self.assertEqual(week_start(NEXT_SAT), NEXT_SAT)
+
+
+class ShiftInfoTests(SimpleTestCase):
+    def test_minutes_including_overnight(self):
+        self.assertEqual(MORNING.minutes, 480)
+        self.assertEqual(NIGHT.minutes, 480)
+
+
+class CoverageTests(SimpleTestCase):
+    def test_full_coverage_when_enough_staff(self):
+        problem = Problem(
+            employees=make_employees(3),
+            shifts=[MORNING],
+            requirements=[Requirement(d, 1, 2) for d in (SAT, SUN, MON)],
+        )
+        solution = solve(problem)
+        self.assertTrue(solution.is_complete)
+        for day in (SAT, SUN, MON):
+            on_day = [a for a in solution.assignments if a.day == day]
+            self.assertEqual(len(on_day), 2)
+            self.assertEqual(len({a.employee_id for a in on_day}), 2)
+
+    def test_no_requirements_gives_empty_solution(self):
+        solution = solve(Problem(employees=make_employees(2), shifts=[MORNING], requirements=[]))
+        self.assertEqual(solution.assignments, [])
+        self.assertTrue(solution.is_complete)
+
+    def test_shortage_is_reported_with_reason(self):
+        problem = Problem(
+            employees=make_employees(1),
+            shifts=[MORNING],
+            requirements=[Requirement(SAT, 1, 2)],
+        )
+        solution = solve(problem)
+        self.assertEqual(len(solution.assignments), 1)
+        self.assertEqual(total_missing(solution), 1)
+        self.assertIn("Only 1", solution.shortages[0].reason)
+
+    def test_nobody_available(self):
+        problem = Problem(
+            employees=make_employees(1),
+            shifts=[MORNING],
+            requirements=[Requirement(SAT, 1, 1)],
+            unavailable={(1, SAT, 1)},
+        )
+        solution = solve(problem)
+        self.assertEqual(solution.assignments, [])
+        self.assertEqual(solution.shortages[0].reason, "No employee is available.")
+
+    def test_unavailable_employee_is_not_assigned(self):
+        problem = Problem(
+            employees=make_employees(2),
+            shifts=[MORNING],
+            requirements=[Requirement(SAT, 1, 1)],
+            unavailable={(1, SAT, 1)},
+        )
+        solution = solve(problem)
+        self.assertTrue(solution.is_complete)
+        self.assertEqual([a.employee_id for a in solution.assignments], [2])
+
+
+class SkillTests(SimpleTestCase):
+    def test_skill_minimum_is_respected(self):
+        employees = [
+            EmployeeInfo(1, "Skilled", frozenset({CASHIER})),
+            EmployeeInfo(2, "B"),
+            EmployeeInfo(3, "C"),
+        ]
+        problem = Problem(
+            employees=employees,
+            shifts=[MORNING],
+            requirements=[Requirement(SAT, 1, 2, {CASHIER: 1})],
+        )
+        solution = solve(problem)
+        self.assertTrue(solution.is_complete)
+        self.assertIn(1, {a.employee_id for a in solution.assignments})
+
+    def test_skill_shortage_is_reported(self):
+        problem = Problem(
+            employees=make_employees(2),
+            shifts=[MORNING],
+            requirements=[Requirement(SAT, 1, 1, {CASHIER: 1})],
+        )
+        solution = solve(problem)
+        self.assertEqual(len(solution.assignments), 1)  # headcount still filled
+        self.assertEqual(len(solution.shortages), 1)
+        shortage = solution.shortages[0]
+        self.assertEqual(shortage.skill_id, CASHIER)
+        self.assertEqual(shortage.missing_count, 1)
+        self.assertEqual(shortage.reason, "No available employee has this skill.")
+
+
+class HourLimitTests(SimpleTestCase):
+    def test_weekly_limit_is_enforced(self):
+        problem = Problem(
+            employees=make_employees(1, max_weekly_minutes=16 * 60),
+            shifts=[MORNING],
+            requirements=[Requirement(d, 1, 1) for d in (SAT, SUN, MON)],
+        )
+        solution = solve(problem)
+        self.assertEqual(len(solution.assignments), 2)
+        self.assertEqual(total_missing(solution), 1)
+
+    def test_weekly_limit_resets_on_saturday(self):
+        # Friday and the next Saturday are in different Iranian weeks.
+        problem = Problem(
+            employees=make_employees(1, max_weekly_minutes=8 * 60),
+            shifts=[MORNING],
+            requirements=[Requirement(FRI, 1, 1), Requirement(NEXT_SAT, 1, 1)],
+        )
+        solution = solve(problem)
+        self.assertTrue(solution.is_complete)
+        self.assertEqual(len(solution.assignments), 2)
+
+
+class RuleTests(SimpleTestCase):
+    def test_one_shift_per_day(self):
+        problem = Problem(
+            employees=make_employees(1),
+            shifts=[MORNING, EVENING],
+            requirements=[Requirement(SAT, 1, 1), Requirement(SAT, 2, 1)],
+        )
+        solution = solve(problem)
+        self.assertEqual(len(solution.assignments), 1)
+        self.assertEqual(total_missing(solution), 1)
+
+    def test_minimum_rest_blocks_back_to_back_shifts(self):
+        # Night ends 06:00 Sunday, morning starts 08:00: only 2 hours of rest.
+        requirements = [Requirement(SAT, 3, 1), Requirement(SUN, 1, 1)]
+        one = solve(Problem(make_employees(1), [MORNING, NIGHT], requirements))
+        self.assertEqual(len(one.assignments), 1)
+        self.assertEqual(total_missing(one), 1)
+
+        two = solve(Problem(make_employees(2), [MORNING, NIGHT], requirements))
+        self.assertTrue(two.is_complete)
+        self.assertEqual({a.employee_id for a in two.assignments}, {1, 2})
+
+
+class ValidationTests(SimpleTestCase):
+    def test_duplicate_requirement_is_rejected(self):
+        problem = Problem(
+            employees=make_employees(1),
+            shifts=[MORNING],
+            requirements=[Requirement(SAT, 1, 1), Requirement(SAT, 1, 2)],
+        )
+        with self.assertRaises(ValueError):
+            solve(problem)
+
+    def test_unknown_shift_is_rejected(self):
+        problem = Problem(
+            employees=make_employees(1),
+            shifts=[MORNING],
+            requirements=[Requirement(SAT, 99, 1)],
+        )
+        with self.assertRaises(ValueError):
+            solve(problem)
