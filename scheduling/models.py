@@ -364,4 +364,192 @@ class LeaveRequest(TenantModel):
 
     def reject(self, reviewer):
         self._review(reviewer, self.Status.REJECTED)
-        
+
+
+def _organization_errors(instance, field_names):
+    """Return a ValidationError dict for related objects of another organization."""
+    errors = {}
+    if not instance.organization_id:
+        return errors
+    for name in field_names:
+        related = getattr(instance, name, None)
+        if related is not None and related.organization_id != instance.organization_id:
+            errors[name] = _("This object must belong to the same organization.")
+    return errors
+
+
+class Schedule(TenantModel):
+    """A generated schedule for a date range (a week, a month, ...)."""
+
+    class Status(models.TextChoices):
+        DRAFT = "draft", _("Draft")
+        PUBLISHED = "published", _("Published")
+
+    name = models.CharField(_("name"), max_length=150, blank=True)
+    start_date = models.DateField(_("start date"))
+    end_date = models.DateField(_("end date"))
+    status = models.CharField(
+        _("status"), max_length=10, choices=Status.choices, default=Status.DRAFT
+    )
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="created_schedules",
+        verbose_name=_("created by"),
+    )
+    created_at = models.DateTimeField(_("created at"), auto_now_add=True)
+    published_at = models.DateTimeField(_("published at"), null=True, blank=True)
+
+    class Meta:
+        verbose_name = _("schedule")
+        verbose_name_plural = _("schedules")
+        ordering = ["-start_date"]
+        constraints = [
+            models.CheckConstraint(
+                condition=models.Q(end_date__gte=models.F("start_date")),
+                name="schedule_end_not_before_start",
+            ),
+        ]
+
+    def __str__(self):
+        label = self.name or f"{self.start_date} - {self.end_date}"
+        return f"{label} ({self.get_status_display()})"
+
+    @property
+    def days(self):
+        return (self.end_date - self.start_date).days + 1
+
+    def dates(self):
+        """Every date of the schedule, in order."""
+        return [self.start_date + timedelta(days=i) for i in range(self.days)]
+
+    def clean(self):
+        super().clean()
+        errors = _organization_errors(self, ["created_by"])
+        if errors:
+            raise ValidationError(errors)
+
+
+class ShiftAssignment(TenantModel):
+    """One employee working one shift type on one date of a schedule.
+
+    An employee works at most one shift per day in a schedule.
+    """
+
+    schedule = models.ForeignKey(
+        Schedule,
+        on_delete=models.CASCADE,
+        related_name="assignments",
+        verbose_name=_("schedule"),
+    )
+    employee = models.ForeignKey(
+        EmployeeProfile,
+        on_delete=models.RESTRICT,
+        related_name="assignments",
+        verbose_name=_("employee"),
+    )
+    shift_type = models.ForeignKey(
+        ShiftType,
+        on_delete=models.RESTRICT,
+        related_name="assignments",
+        verbose_name=_("shift type"),
+    )
+    date = models.DateField(_("date"))
+    is_manual = models.BooleanField(
+        _("manually edited"),
+        default=False,
+        help_text=_("Set when a manager added or changed this assignment by hand."),
+    )
+
+    class Meta:
+        verbose_name = _("shift assignment")
+        verbose_name_plural = _("shift assignments")
+        ordering = ["date", "shift_type__start_time", "employee"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["schedule", "employee", "date"],
+                name="one_shift_per_employee_per_day",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.date} {self.shift_type.name}: {self.employee}"
+
+    @property
+    def start_at(self):
+        return datetime.combine(self.date, self.shift_type.start_time)
+
+    @property
+    def end_at(self):
+        return self.start_at + self.shift_type.duration
+
+    @property
+    def hours(self):
+        return self.shift_type.duration_hours
+
+    def clean(self):
+        super().clean()
+        errors = _organization_errors(self, ["schedule", "employee", "shift_type"])
+        schedule = getattr(self, "schedule", None)
+        if schedule is not None and self.date:
+            if not (schedule.start_date <= self.date <= schedule.end_date):
+                errors["date"] = _("The date must fall within the schedule period.")
+        if errors:
+            raise ValidationError(errors)
+
+
+class UnfilledSlot(TenantModel):
+    """Staff the generator could not find for a shift, with the reason."""
+
+    schedule = models.ForeignKey(
+        Schedule,
+        on_delete=models.CASCADE,
+        related_name="unfilled_slots",
+        verbose_name=_("schedule"),
+    )
+    date = models.DateField(_("date"))
+    shift_type = models.ForeignKey(
+        ShiftType,
+        on_delete=models.RESTRICT,
+        related_name="unfilled_slots",
+        verbose_name=_("shift type"),
+    )
+    skill = models.ForeignKey(
+        Skill,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="unfilled_slots",
+        verbose_name=_("missing skill"),
+        help_text=_("Empty means people are missing regardless of skill."),
+    )
+    missing_count = models.PositiveSmallIntegerField(
+        _("missing staff"), validators=[MinValueValidator(1)]
+    )
+    reason = models.TextField(_("reason"), blank=True)
+
+    class Meta:
+        verbose_name = _("unfilled slot")
+        verbose_name_plural = _("unfilled slots")
+        ordering = ["date", "shift_type__start_time"]
+        constraints = [
+            models.CheckConstraint(
+                condition=models.Q(missing_count__gte=1),
+                name="unfilled_missing_count_at_least_one",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.date} {self.shift_type.name}: {self.missing_count} missing"
+
+    def clean(self):
+        super().clean()
+        errors = _organization_errors(self, ["schedule", "shift_type", "skill"])
+        schedule = getattr(self, "schedule", None)
+        if schedule is not None and self.date:
+            if not (schedule.start_date <= self.date <= schedule.end_date):
+                errors["date"] = _("The date must fall within the schedule period.")
+        if errors:
+            raise ValidationError(errors)        
