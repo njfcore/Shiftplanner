@@ -1,4 +1,6 @@
+from .availability import Window, can_work
 from .data import (
+    DEFAULT_MIN_REST_MINUTES,
     Assignment,
     EmployeeInfo,
     Problem,
@@ -10,6 +12,7 @@ from .data import (
 from .engine import SolverError, solve, week_start
 
 __all__ = [
+    "DEFAULT_MIN_REST_MINUTES",
     "Assignment",
     "EmployeeInfo",
     "Problem",
@@ -18,6 +21,8 @@ __all__ = [
     "Shortage",
     "Solution",
     "SolverError",
+    "Window",
+    "can_work",
     "solve",
     "week_start",
 ]
