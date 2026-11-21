@@ -3,11 +3,13 @@ from datetime import datetime, timedelta
 
 from ortools.sat.python import cp_model
 
-from .data import Assignment, Shortage, Solution
+from .data import Assignment, Shortage, Solution, is_holiday
 
-# Filling a seat matters more than satisfying a skill minimum.
-HEAD_WEIGHT = 1000
-SKILL_WEIGHT = 100
+# Objective weights, from most to least important.
+HEAD_WEIGHT = 1000  # a seat left empty
+SKILL_WEIGHT = 100  # a skill minimum not met
+HEAVY_WEIGHT = 30  # one unit of gap in night or holiday shifts between employees
+WORK_WEIGHT = 3  # one hour of gap in total working hours between employees
 
 
 class SolverError(Exception):
@@ -55,6 +57,33 @@ def _explain(problem, requirement, skill_id, needed):
     )
 
 
+def _load_hours(shift):
+    """Working load of a shift in whole hours (used for fairness only)."""
+    return max(1, round(shift.minutes / 60))
+
+
+def _balance_penalty(model, name, weight, carried, terms):
+    """Penalty on the gap between the most and the least loaded employee.
+
+    carried: employee_id -> load that employee already carries.
+    terms: employee_id -> list of (coefficient, variable) this schedule adds.
+    """
+    if not terms:
+        return []
+    upper = max(carried.values(), default=0) + sum(
+        coefficient for parts in terms.values() for coefficient, _var in parts
+    )
+    busiest = model.new_int_var(0, upper, f"{name}_max")
+    lightest = model.new_int_var(0, upper, f"{name}_min")
+    for emp_id, base in carried.items():
+        total = base + sum(
+            coefficient * var for coefficient, var in terms.get(emp_id, [])
+        )
+        model.add(total <= busiest)
+        model.add(total >= lightest)
+    return [weight * (busiest - lightest)]
+
+
 def solve(problem):
     """Build the best possible schedule for the problem.
 
@@ -62,6 +91,8 @@ def solve(problem):
     when unavailable, weekly hour limit, minimum rest between shifts,
     never more people than a shift needs.
     Coverage is soft: missing staff is minimised and reported as shortages.
+    Among equally covered schedules, the solver prefers a fair one: night
+    shifts, holiday shifts and total hours are spread evenly.
     """
     _validate(problem)
     if not problem.requirements:
@@ -153,6 +184,31 @@ def solve(problem):
                 if start_of(second[1], second[2]) - first_end >= rest:
                     break  # later shifts start even later
                 model.add(x[first] + x[second] <= 1)
+
+    # Fairness (soft): balance night shifts, holiday shifts and total hours.
+    night_terms = defaultdict(list)
+    holiday_terms = defaultdict(list)
+    work_terms = defaultdict(list)
+    for (emp_id, day, shift_id), var in x.items():
+        shift = shifts[shift_id]
+        work_terms[emp_id].append((_load_hours(shift), var))
+        if shift.is_night:
+            night_terms[emp_id].append((1, var))
+        if is_holiday(day, problem.holidays):
+            holiday_terms[emp_id].append((1, var))
+
+    penalties += _balance_penalty(
+        model, "nights", HEAVY_WEIGHT,
+        {e.id: e.past_night_shifts for e in problem.employees}, night_terms,
+    )
+    penalties += _balance_penalty(
+        model, "holidays", HEAVY_WEIGHT,
+        {e.id: e.past_holiday_shifts for e in problem.employees}, holiday_terms,
+    )
+    penalties += _balance_penalty(
+        model, "work", WORK_WEIGHT,
+        {e.id: 0 for e in problem.employees}, work_terms,
+    )
 
     model.minimize(sum(penalties))
 

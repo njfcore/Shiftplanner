@@ -553,3 +553,24 @@ class UnfilledSlot(TenantModel):
                 errors["date"] = _("The date must fall within the schedule period.")
         if errors:
             raise ValidationError(errors)        
+
+
+class Holiday(TenantModel):
+    """An official holiday of the organization (Fridays are always holidays)."""
+
+    date = models.DateField(_("date"))
+    name = models.CharField(_("name"), max_length=100, blank=True)
+
+    class Meta:
+        verbose_name = _("holiday")
+        verbose_name_plural = _("holidays")
+        ordering = ["date"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["organization", "date"],
+                name="unique_holiday_date_per_organization",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.date} {self.name}".strip()        
