@@ -20,6 +20,7 @@ from .models import (
     SkillRequirement,
     UnfilledSlot,
     Weekday,
+    Holiday
 )
 
 
@@ -415,3 +416,19 @@ class UnfilledSlotTests(TestCase):
         )
         with self.assertRaises(ValidationError):
             slot.full_clean()  
+
+
+class HolidayTests(TestCase):
+    def setUp(self):
+        self.org = Organization.objects.create(name="Org")
+        self.other = Organization.objects.create(name="Other")
+
+    def test_same_date_allowed_in_different_organizations(self):
+        Holiday.objects.create(organization=self.org, date=date(2026, 12, 21), name="Yalda")
+        Holiday.objects.create(organization=self.other, date=date(2026, 12, 21))
+        self.assertEqual(Holiday.objects.filter(date=date(2026, 12, 21)).count(), 2)
+
+    def test_duplicate_date_in_same_organization_is_rejected(self):
+        Holiday.objects.create(organization=self.org, date=date(2026, 12, 21))
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            Holiday.objects.create(organization=self.org, date=date(2026, 12, 21))            

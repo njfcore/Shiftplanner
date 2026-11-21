@@ -15,6 +15,7 @@ from .models import (
     Skill,
     SkillRequirement,
     UnfilledSlot,
+    Holiday
 )
 
 @admin.register(Skill)
@@ -103,3 +104,10 @@ class ShiftAssignmentAdmin(admin.ModelAdmin):
 class UnfilledSlotAdmin(admin.ModelAdmin):
     list_display = ("date", "shift_type", "skill", "missing_count", "schedule")
     list_filter = ("organization", "schedule")
+
+
+@admin.register(Holiday)
+class HolidayAdmin(admin.ModelAdmin):
+    list_display = ("date", "name", "organization")
+    list_filter = ("organization",)
+    date_hierarchy = "date"    
