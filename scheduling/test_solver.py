@@ -18,6 +18,8 @@ NIGHT = ShiftInfo(3, "Night", time(22, 0), time(6, 0), is_night=True)
 SAT = date(2026, 11, 14)
 SUN = date(2026, 11, 15)
 MON = date(2026, 11, 16)
+TUE = date(2026, 11, 17)
+NEXT_MON = date(2026, 11, 23)
 NEXT_SAT = date(2026, 11, 21)
 FRI = date(2026, 11, 20)
 
@@ -194,3 +196,76 @@ class ValidationTests(SimpleTestCase):
         )
         with self.assertRaises(ValueError):
             solve(problem)
+
+
+def count_by_employee(solution):
+    counts = {}
+    for a in solution.assignments:
+        counts[a.employee_id] = counts.get(a.employee_id, 0) + 1
+    return counts
+
+
+class FairnessTests(SimpleTestCase):
+    def test_night_shifts_are_shared_equally(self):
+        problem = Problem(
+            employees=make_employees(2),
+            shifts=[NIGHT],
+            requirements=[Requirement(d, 3, 1) for d in (SAT, SUN, MON, TUE)],
+        )
+        solution = solve(problem)
+        self.assertTrue(solution.is_complete)
+        self.assertEqual(count_by_employee(solution), {1: 2, 2: 2})
+
+    def test_past_night_shifts_are_taken_into_account(self):
+        employees = [EmployeeInfo(1, "E1", past_night_shifts=2), EmployeeInfo(2, "E2")]
+        problem = Problem(
+            employees=employees,
+            shifts=[NIGHT],
+            requirements=[Requirement(SAT, 3, 1), Requirement(SUN, 3, 1)],
+        )
+        solution = solve(problem)
+        self.assertEqual(count_by_employee(solution), {2: 2})
+
+    def test_friday_counts_as_a_holiday(self):
+        employees = [EmployeeInfo(1, "E1", past_holiday_shifts=1), EmployeeInfo(2, "E2")]
+        problem = Problem(
+            employees=employees,
+            shifts=[MORNING],
+            requirements=[Requirement(FRI, 1, 1), Requirement(NEXT_MON, 1, 1)],
+        )
+        solution = solve(problem)
+        friday = [a for a in solution.assignments if a.day == FRI]
+        self.assertEqual([a.employee_id for a in friday], [2])
+
+    def test_registered_holidays_are_used(self):
+        employees = [EmployeeInfo(1, "E1", past_holiday_shifts=1), EmployeeInfo(2, "E2")]
+        problem = Problem(
+            employees=employees,
+            shifts=[MORNING],
+            requirements=[Requirement(SAT, 1, 1), Requirement(SUN, 1, 1)],
+            holidays={SAT},
+        )
+        solution = solve(problem)
+        saturday = [a for a in solution.assignments if a.day == SAT]
+        self.assertEqual([a.employee_id for a in saturday], [2])
+
+    def test_total_hours_are_shared(self):
+        problem = Problem(
+            employees=make_employees(2),
+            shifts=[MORNING],
+            requirements=[Requirement(d, 1, 1) for d in (SAT, SUN, MON, TUE)],
+        )
+        solution = solve(problem)
+        self.assertEqual(count_by_employee(solution), {1: 2, 2: 2})
+
+    def test_fairness_never_costs_coverage(self):
+        employees = [EmployeeInfo(1, "E1", past_night_shifts=10), EmployeeInfo(2, "E2")]
+        problem = Problem(
+            employees=employees,
+            shifts=[NIGHT],
+            requirements=[Requirement(SAT, 3, 1)],
+            unavailable={(2, SAT, 3)},
+        )
+        solution = solve(problem)
+        self.assertTrue(solution.is_complete)
+        self.assertEqual([a.employee_id for a in solution.assignments], [1])         

@@ -14,6 +14,7 @@ from .models import (
     ShiftRequirement,
     ShiftType,
     UnfilledSlot,
+    Holiday,
 )
 from .solver import (
     DEFAULT_MIN_REST_MINUTES,
@@ -24,7 +25,37 @@ from .solver import (
     Window,
     can_work,
     solve,
+    is_holiday,
 )
+
+HISTORY_DAYS = 90
+
+
+def _heavy_history(schedule, holiday_dates):
+    """Count recent night and holiday shifts per employee.
+
+    Only published schedules count, and only the HISTORY_DAYS days before
+    this schedule starts.
+    """
+    since = schedule.start_date - timedelta(days=HISTORY_DAYS)
+    past = (
+        ShiftAssignment.objects.for_organization(schedule.organization)
+        .filter(
+            schedule__status=Schedule.Status.PUBLISHED,
+            date__gte=since,
+            date__lt=schedule.start_date,
+        )
+        .exclude(schedule=schedule)
+        .select_related("shift_type")
+    )
+    nights = defaultdict(int)
+    holidays = defaultdict(int)
+    for item in past:
+        if item.shift_type.is_night:
+            nights[item.employee_id] += 1
+        if is_holiday(item.date, holiday_dates):
+            holidays[item.employee_id] += 1
+    return nights, holidays
 
 
 def build_problem(
@@ -42,12 +73,23 @@ def build_problem(
         .select_related("user")
         .prefetch_related("skills")
     )
+
+    since = schedule.start_date - timedelta(days=HISTORY_DAYS)
+    holiday_dates = set(
+        Holiday.objects.for_organization(organization)
+        .filter(date__gte=since, date__lte=schedule.end_date)
+        .values_list("date", flat=True)
+    )
+    past_nights, past_holidays = _heavy_history(schedule, holiday_dates)
+
     employees = [
         EmployeeInfo(
             id=profile.id,
             name=str(profile.user),
             skill_ids=frozenset(skill.id for skill in profile.skills.all()),
             max_weekly_minutes=profile.max_weekly_hours * 60,
+            past_night_shifts=past_nights[profile.id],
+            past_holiday_shifts=past_holidays[profile.id],
         )
         for profile in profiles
     ]
@@ -125,6 +167,7 @@ def build_problem(
         shifts=shifts,
         requirements=requirements,
         unavailable=unavailable,
+        holidays=holiday_dates,
         min_rest_minutes=min_rest_minutes,
         time_limit_seconds=time_limit_seconds,
     )

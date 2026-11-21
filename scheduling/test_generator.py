@@ -16,6 +16,8 @@ from .models import (
     Skill,
     SkillRequirement,
     Weekday,
+    Holiday, 
+    ShiftAssignment,
 )
 from .services import generate_schedule
 
@@ -171,3 +173,61 @@ class AvailabilityRulesTests(GeneratorTestCase):
         self.require(Weekday.SATURDAY, 1)
         generate_schedule(self.schedule)
         self.assertEqual(self.assigned_ids(), {free.id})
+
+
+class FairnessHistoryTests(GeneratorTestCase):
+    def setUp(self):
+        super().setUp()
+        self.night = ShiftType.objects.create(
+            organization=self.org, name="Night",
+            start_time=time(22, 0), end_time=time(6, 0), is_night=True,
+        )
+        self.previous = Schedule.objects.create(
+            organization=self.org, start_date=date(2026, 11, 7),
+            end_date=date(2026, 11, 13), status=Schedule.Status.PUBLISHED,
+        )
+        self.a = self.employee()
+        self.b = self.employee()
+
+    def require_night(self, weekday):
+        ShiftRequirement.objects.create(
+            organization=self.org, shift_type=self.night,
+            weekday=weekday, required_count=1,
+        )
+
+    def past_assignment(self, employee, day, shift):
+        ShiftAssignment.objects.create(
+            organization=self.org, schedule=self.previous,
+            employee=employee, shift_type=shift, date=day,
+        )
+
+    def assigned_employee_ids(self):
+        return list(self.schedule.assignments.values_list("employee_id", flat=True))
+
+    def test_past_published_nights_are_balanced(self):
+        self.past_assignment(self.a, date(2026, 11, 7), self.night)
+        self.past_assignment(self.a, date(2026, 11, 8), self.night)
+        self.require_night(Weekday.SATURDAY)
+        self.require_night(Weekday.SUNDAY)
+        generate_schedule(self.schedule)
+        self.assertCountEqual(self.assigned_employee_ids(), [self.b.id, self.b.id])
+
+    def test_draft_schedules_are_ignored_as_history(self):
+        self.previous.status = Schedule.Status.DRAFT
+        self.previous.save()
+        self.past_assignment(self.a, date(2026, 11, 7), self.night)
+        self.past_assignment(self.a, date(2026, 11, 8), self.night)
+        self.require_night(Weekday.SATURDAY)
+        self.require_night(Weekday.SUNDAY)
+        generate_schedule(self.schedule)
+        self.assertCountEqual(self.assigned_employee_ids(), [self.a.id, self.b.id])
+
+    def test_registered_holiday_and_friday_history(self):
+        Holiday.objects.create(organization=self.org, date=SAT, name="Test holiday")
+        # 2026-11-13 is a Friday, so A already worked one holiday shift.
+        self.past_assignment(self.a, date(2026, 11, 13), self.morning)
+        self.require(Weekday.SATURDAY, 1)
+        self.require(Weekday.SUNDAY, 1)
+        generate_schedule(self.schedule)
+        saturday = self.schedule.assignments.get(date=SAT)
+        self.assertEqual(saturday.employee_id, self.b.id)        

@@ -3,6 +3,12 @@ from datetime import date, datetime, time, timedelta
 
 DEFAULT_MAX_WEEKLY_MINUTES = 44 * 60
 DEFAULT_MIN_REST_MINUTES = 8 * 60
+FRIDAY = 4  # date.weekday()
+
+
+def is_holiday(day, holidays=()):
+    """Fridays are always holidays; `holidays` holds the extra official ones."""
+    return day.weekday() == FRIDAY or day in holidays
 
 
 @dataclass(frozen=True)
@@ -32,6 +38,9 @@ class EmployeeInfo:
     name: str = ""
     skill_ids: frozenset = frozenset()
     max_weekly_minutes: int = DEFAULT_MAX_WEEKLY_MINUTES
+    # Recent heavy shifts from earlier published schedules.
+    past_night_shifts: int = 0
+    past_holiday_shifts: int = 0
 
 
 @dataclass
@@ -53,6 +62,8 @@ class Problem:
     # (employee_id, day, shift_id) combinations the employee cannot work
     # (approved leave, unavailable window, ...).
     unavailable: set = field(default_factory=set)
+    # Extra official holidays (dates). Fridays are always holidays.
+    holidays: set = field(default_factory=set)
     min_rest_minutes: int = DEFAULT_MIN_REST_MINUTES
     time_limit_seconds: float = 10.0
 

@@ -8,6 +8,7 @@ from .data import (
     ShiftInfo,
     Shortage,
     Solution,
+    is_holiday,
 )
 from .engine import SolverError, solve, week_start
 
@@ -25,4 +26,5 @@ __all__ = [
     "can_work",
     "solve",
     "week_start",
+    "is_holiday",
 ]
