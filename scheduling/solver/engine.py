@@ -25,7 +25,8 @@ def _validate(problem):
     shift_ids = {s.id for s in problem.shifts}
     if len(shift_ids) != len(problem.shifts):
         raise ValueError("Duplicate shift ids.")
-    if len({e.id for e in problem.employees}) != len(problem.employees):
+    employee_ids = {e.id for e in problem.employees}
+    if len(employee_ids) != len(problem.employees):
         raise ValueError("Duplicate employee ids.")
     seen = set()
     for req in problem.requirements:
@@ -35,6 +36,15 @@ def _validate(problem):
         if key in seen:
             raise ValueError(f"Duplicate requirement for {key}.")
         seen.add(key)
+    fixed_days = set()
+    for employee_id, day, shift_id in problem.fixed:
+        if employee_id not in employee_ids:
+            raise ValueError(f"Unknown employee id {employee_id} in fixed assignments.")
+        if shift_id not in shift_ids:
+            raise ValueError(f"Unknown shift id {shift_id} in fixed assignments.")
+        if (employee_id, day) in fixed_days:
+            raise ValueError("An employee has two fixed assignments on the same day.")
+        fixed_days.add((employee_id, day))
 
 
 def _explain(problem, requirement, skill_id, needed):
@@ -87,16 +97,26 @@ def _balance_penalty(model, name, weight, carried, terms):
 def solve(problem):
     """Build the best possible schedule for the problem.
 
-    Hard rules (never broken): one shift per employee per day, no work
-    when unavailable, weekly hour limit, minimum rest between shifts,
-    never more people than a shift needs.
+    Hard rules (never broken for new assignments): one shift per employee
+    per day, no work when unavailable, weekly hour limit, minimum rest
+    between shifts, never more people than a shift needs.
+    Fixed assignments (manual edits) are always kept, even when they break
+    those rules; they only limit what can be added around them.
     Coverage is soft: missing staff is minimised and reported as shortages.
     Among equally covered schedules, the solver prefers a fair one: night
     shifts, holiday shifts and total hours are spread evenly.
     """
     _validate(problem)
+    fixed = set(problem.fixed)
+
     if not problem.requirements:
-        return Solution(status="optimal")
+        return Solution(
+            status="optimal",
+            assignments=sorted(
+                (Assignment(*key) for key in fixed),
+                key=lambda a: (a.day, a.shift_id, a.employee_id),
+            ),
+        )
 
     shifts = {s.id: s for s in problem.shifts}
     employees = {e.id: e for e in problem.employees}
@@ -104,13 +124,22 @@ def solve(problem):
     model = cp_model.CpModel()
 
     # x[(employee, day, shift)] = 1 when the employee works that shift.
-    # Variables exist only where the shift is needed and the employee is free.
+    # Variables exist where the shift is needed and the employee is free,
+    # plus every fixed assignment (which is forced to 1).
     x = {}
     for req in problem.requirements:
         for emp in problem.employees:
             key = (emp.id, req.day, req.shift_id)
-            if key not in problem.unavailable:
+            if key not in problem.unavailable or key in fixed:
                 x[key] = model.new_bool_var(f"x_{emp.id}_{req.day}_{req.shift_id}")
+    for key in fixed:
+        if key not in x:
+            x[key] = model.new_bool_var(f"x_{key[0]}_{key[1]}_{key[2]}")
+        model.add(x[key] == 1)
+
+    fixed_per_slot = defaultdict(int)
+    for _emp_id, day, shift_id in fixed:
+        fixed_per_slot[(day, shift_id)] += 1
 
     # One shift per employee per day.
     per_day = defaultdict(list)
@@ -134,7 +163,8 @@ def solve(problem):
         slack = model.new_int_var(0, req.required_count, f"missing_{req.day}_{req.shift_id}")
         if slot_vars:
             model.add(sum(slot_vars) + slack >= req.required_count)
-            model.add(sum(slot_vars) <= req.required_count)
+            # Manual edits may put more people on a shift than required.
+            model.add(sum(slot_vars) <= max(req.required_count, fixed_per_slot[slot]))
         else:
             model.add(slack >= req.required_count)
         head_slack[slot] = slack
@@ -156,14 +186,20 @@ def solve(problem):
             skill_slack[(req.day, req.shift_id, skill_id)] = s_slack
             penalties.append(SKILL_WEIGHT * s_slack)
 
-    # Weekly hour limit (Saturday-based week).
+    # Weekly hour limit (Saturday-based week). Fixed assignments alone may
+    # already exceed it; then they only block further shifts that week.
+    fixed_minutes = defaultdict(int)
+    for emp_id, day, shift_id in fixed:
+        fixed_minutes[(emp_id, week_start(day))] += shifts[shift_id].minutes
     per_week = defaultdict(list)
     for (emp_id, day, shift_id), var in x.items():
         per_week[(emp_id, week_start(day))].append(shifts[shift_id].minutes * var)
-    for (emp_id, _week), terms in per_week.items():
-        model.add(sum(terms) <= employees[emp_id].max_weekly_minutes)
+    for (emp_id, week), terms in per_week.items():
+        limit = max(employees[emp_id].max_weekly_minutes, fixed_minutes[(emp_id, week)])
+        model.add(sum(terms) <= limit)
 
-    # Minimum rest between two shifts of the same employee.
+    # Minimum rest between two shifts of the same employee. A pair of fixed
+    # assignments is skipped: the manager chose it, the checker will report it.
     def start_of(day, shift_id):
         return datetime.combine(day, shifts[shift_id].start_time)
 
@@ -183,6 +219,8 @@ def solve(problem):
                 second = keys[j]
                 if start_of(second[1], second[2]) - first_end >= rest:
                     break  # later shifts start even later
+                if first in fixed and second in fixed:
+                    continue
                 model.add(x[first] + x[second] <= 1)
 
     # Fairness (soft): balance night shifts, holiday shifts and total hours.

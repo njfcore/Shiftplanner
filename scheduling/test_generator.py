@@ -19,7 +19,7 @@ from .models import (
     Holiday, 
     ShiftAssignment,
 )
-from .services import generate_schedule
+from .services import generate_schedule, check_schedule
 
 SAT = date(2026, 11, 14)
 SUN = date(2026, 11, 15)
@@ -231,3 +231,97 @@ class FairnessHistoryTests(GeneratorTestCase):
         generate_schedule(self.schedule)
         saturday = self.schedule.assignments.get(date=SAT)
         self.assertEqual(saturday.employee_id, self.b.id)        
+
+
+class ManualAssignmentTests(GeneratorTestCase):
+    def setUp(self):
+        super().setUp()
+        self.a = self.employee()
+        self.b = self.employee()
+
+    def manual(self, employee, day=SAT):
+        return ShiftAssignment.objects.create(
+            organization=self.org, schedule=self.schedule, employee=employee,
+            shift_type=self.morning, date=day, is_manual=True,
+        )
+
+    def leave(self, employee, day=SAT):
+        LeaveRequest.objects.create(
+            organization=self.org, employee=employee, start_date=day, end_date=day,
+            status=LeaveRequest.Status.APPROVED,
+        )
+
+    def test_manual_assignment_is_kept_even_during_leave(self):
+        self.leave(self.b)
+        self.require(Weekday.SATURDAY, 1)
+        kept = self.manual(self.b)
+        generate_schedule(self.schedule)
+        assignment = self.schedule.assignments.get()
+        self.assertEqual(assignment.pk, kept.pk)
+        self.assertTrue(assignment.is_manual)
+
+    def test_manual_assignment_counts_toward_coverage(self):
+        self.employee()  # a third employee
+        self.require(Weekday.SATURDAY, 2)
+        self.manual(self.b)
+        generate_schedule(self.schedule)
+        self.assertEqual(self.schedule.assignments.count(), 2)
+        self.assertIn(self.b.id, self.assigned_ids())
+        self.assertEqual(self.schedule.assignments.filter(is_manual=True).count(), 1)
+
+    def test_manual_assignment_is_discarded_when_requested(self):
+        self.leave(self.b)
+        self.require(Weekday.SATURDAY, 1)
+        self.manual(self.b)
+        generate_schedule(self.schedule, keep_manual=False)
+        assignment = self.schedule.assignments.get()
+        self.assertEqual(assignment.employee_id, self.a.id)
+        self.assertFalse(assignment.is_manual)
+
+    def test_manual_assignment_of_inactive_employee_is_left_alone(self):
+        inactive = self.employee(is_active=False)
+        self.manual(inactive)
+        self.require(Weekday.SATURDAY, 1)
+        generate_schedule(self.schedule)
+        self.assertEqual(self.schedule.assignments.filter(employee=inactive).count(), 1)
+        self.assertEqual(self.schedule.assignments.filter(is_manual=False).count(), 1)
+
+
+class CheckScheduleTests(GeneratorTestCase):
+    def setUp(self):
+        super().setUp()
+        self.a = self.employee()
+        self.b = self.employee()
+
+    def codes(self):
+        return {v.code for v in check_schedule(self.schedule)}
+
+    def test_generated_schedule_has_no_violations(self):
+        self.require(Weekday.SATURDAY, 2)
+        generate_schedule(self.schedule)
+        self.assertEqual(check_schedule(self.schedule), [])
+
+    def test_assignment_during_approved_leave_is_flagged(self):
+        LeaveRequest.objects.create(
+            organization=self.org, employee=self.a, start_date=SAT, end_date=SAT,
+            status=LeaveRequest.Status.APPROVED,
+        )
+        ShiftAssignment.objects.create(
+            organization=self.org, schedule=self.schedule, employee=self.a,
+            shift_type=self.morning, date=SAT,
+        )
+        self.assertIn("unavailable", self.codes())
+
+    def test_assignment_of_inactive_employee_is_flagged(self):
+        inactive = self.employee(is_active=False)
+        ShiftAssignment.objects.create(
+            organization=self.org, schedule=self.schedule, employee=inactive,
+            shift_type=self.morning, date=SAT,
+        )
+        self.assertIn("unknown_employee", self.codes())
+
+    def test_removed_assignment_makes_schedule_understaffed(self):
+        self.require(Weekday.SATURDAY, 2)
+        generate_schedule(self.schedule)
+        self.schedule.assignments.first().delete()
+        self.assertIn("understaffed", self.codes())        
