@@ -7,6 +7,7 @@ from .solver import (
     Problem,
     Requirement,
     ShiftInfo,
+    Assignment,
     solve,
     week_start,
 )
@@ -269,3 +270,80 @@ class FairnessTests(SimpleTestCase):
         solution = solve(problem)
         self.assertTrue(solution.is_complete)
         self.assertEqual([a.employee_id for a in solution.assignments], [1])         
+
+
+class FixedAssignmentTests(SimpleTestCase):
+    def test_fixed_assignment_is_kept(self):
+        problem = Problem(
+            make_employees(2), [MORNING], [Requirement(SAT, 1, 1)], fixed={(2, SAT, 1)}
+        )
+        solution = solve(problem)
+        self.assertEqual([a.employee_id for a in solution.assignments], [2])
+
+    def test_fixed_assignment_overrides_unavailability(self):
+        problem = Problem(
+            make_employees(2), [MORNING], [Requirement(SAT, 1, 1)],
+            unavailable={(2, SAT, 1)}, fixed={(2, SAT, 1)},
+        )
+        solution = solve(problem)
+        self.assertTrue(solution.is_complete)
+        self.assertEqual([a.employee_id for a in solution.assignments], [2])
+
+    def test_fixed_assignment_counts_toward_coverage(self):
+        problem = Problem(
+            make_employees(3), [MORNING], [Requirement(SAT, 1, 2)], fixed={(1, SAT, 1)}
+        )
+        solution = solve(problem)
+        self.assertTrue(solution.is_complete)
+        self.assertEqual(len(solution.assignments), 2)
+        self.assertIn(1, {a.employee_id for a in solution.assignments})
+
+    def test_fixed_assignment_on_a_day_without_requirement_is_kept(self):
+        problem = Problem(
+            make_employees(2), [MORNING], [Requirement(SAT, 1, 1)], fixed={(1, SUN, 1)}
+        )
+        solution = solve(problem)
+        self.assertTrue(solution.is_complete)
+        self.assertIn(Assignment(1, SUN, 1), solution.assignments)
+
+    def test_more_fixed_than_required_is_allowed(self):
+        problem = Problem(
+            make_employees(2), [MORNING], [Requirement(SAT, 1, 1)],
+            fixed={(1, SAT, 1), (2, SAT, 1)},
+        )
+        solution = solve(problem)
+        self.assertTrue(solution.is_complete)
+        self.assertEqual(len(solution.assignments), 2)
+
+    def test_fixed_hours_above_weekly_limit_only_block_more_work(self):
+        problem = Problem(
+            make_employees(1, max_weekly_minutes=8 * 60), [MORNING],
+            [Requirement(MON, 1, 1)], fixed={(1, SAT, 1), (1, SUN, 1)},
+        )
+        solution = solve(problem)
+        self.assertEqual(len(solution.assignments), 2)  # both fixed, none added
+        self.assertEqual(total_missing(solution), 1)
+
+    def test_fixed_pair_breaking_rest_rule_does_not_fail(self):
+        problem = Problem(
+            make_employees(1), [MORNING, NIGHT], [Requirement(TUE, 1, 1)],
+            fixed={(1, SAT, 3), (1, SUN, 1)},
+        )
+        solution = solve(problem)
+        self.assertIn(Assignment(1, SAT, 3), solution.assignments)
+        self.assertIn(Assignment(1, SUN, 1), solution.assignments)
+
+    def test_only_fixed_assignments_without_requirements(self):
+        problem = Problem(make_employees(1), [MORNING], [], fixed={(1, SAT, 1)})
+        solution = solve(problem)
+        self.assertEqual(solution.assignments, [Assignment(1, SAT, 1)])
+
+    def test_invalid_fixed_assignments_are_rejected(self):
+        base = dict(employees=make_employees(1), shifts=[MORNING, NIGHT],
+                    requirements=[Requirement(SAT, 1, 1)])
+        with self.assertRaises(ValueError):
+            solve(Problem(**base, fixed={(1, SAT, 99)}))  # unknown shift
+        with self.assertRaises(ValueError):
+            solve(Problem(**base, fixed={(9, SAT, 1)}))  # unknown employee
+        with self.assertRaises(ValueError):
+            solve(Problem(**base, fixed={(1, SAT, 1), (1, SAT, 3)}))  # same day        

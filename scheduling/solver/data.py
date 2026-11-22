@@ -62,6 +62,9 @@ class Problem:
     # (employee_id, day, shift_id) combinations the employee cannot work
     # (approved leave, unavailable window, ...).
     unavailable: set = field(default_factory=set)
+    # Assignments that must be kept as they are (manual edits by a manager).
+    # They override unavailability and never make the problem infeasible.
+    fixed: set = field(default_factory=set)
     # Extra official holidays (dates). Fridays are always holidays.
     holidays: set = field(default_factory=set)
     min_rest_minutes: int = DEFAULT_MIN_REST_MINUTES
@@ -88,7 +91,7 @@ class Shortage:
 
 @dataclass
 class Solution:
-    status: str  # "optimal" or "feasible" (time limit reached)
+    status: str  # "optimal" or "   feasible" (time limit reached)
     assignments: list = field(default_factory=list)
     shortages: list = field(default_factory=list)
 

@@ -8,24 +8,26 @@ from django.utils.translation import gettext_lazy as _
 from .models import (
     Availability,
     EmployeeProfile,
+    Holiday,
     LeaveRequest,
     Schedule,
     ShiftAssignment,
     ShiftRequirement,
     ShiftType,
     UnfilledSlot,
-    Holiday,
 )
 from .solver import (
     DEFAULT_MIN_REST_MINUTES,
+    Assignment,
     EmployeeInfo,
     Problem,
     Requirement,
     ShiftInfo,
     Window,
     can_work,
-    solve,
+    check_assignments,
     is_holiday,
+    solve,
 )
 
 HISTORY_DAYS = 90
@@ -61,10 +63,15 @@ def _heavy_history(schedule, holiday_dates):
 def build_problem(
     schedule,
     *,
+    keep_manual=True,
     min_rest_minutes=DEFAULT_MIN_REST_MINUTES,
     time_limit_seconds=10.0,
 ):
-    """Translate the organization's data into a solver Problem."""
+    """Translate the organization's data into a solver Problem.
+
+    With keep_manual, the schedule's manually edited assignments of active
+    employees become fixed assignments the solver must keep.
+    """
     organization = schedule.organization
 
     profiles = list(
@@ -93,6 +100,7 @@ def build_problem(
         )
         for profile in profiles
     ]
+    active_ids = {profile.id for profile in profiles}
 
     shifts = [
         ShiftInfo(
@@ -153,31 +161,56 @@ def build_problem(
             )
         )
 
+    existing = ShiftAssignment.objects.for_organization(organization).filter(schedule=schedule)
+
+    # Availability is evaluated for every needed slot and for every slot that
+    # already has an assignment, so the checker can also judge extra shifts.
+    slots = {(req.day, req.shift_id) for req in requirements}
+    slots |= set(existing.values_list("date", "shift_type_id"))
+
     unavailable = set()
-    for req in requirements:
-        shift = shifts_by_id[req.shift_id]
+    for day, shift_id in slots:
+        shift = shifts_by_id[shift_id]
         for employee in employees:
-            if req.day in leave_days[employee.id] or not can_work(
-                windows[employee.id], req.day, shift
+            if day in leave_days[employee.id] or not can_work(
+                windows[employee.id], day, shift
             ):
-                unavailable.add((employee.id, req.day, req.shift_id))
+                unavailable.add((employee.id, day, shift_id))
+
+    fixed = set()
+    if keep_manual:
+        manual = existing.filter(is_manual=True).values_list(
+            "employee_id", "date", "shift_type_id"
+        )
+        fixed = {row for row in manual if row[0] in active_ids}
 
     return Problem(
         employees=employees,
         shifts=shifts,
         requirements=requirements,
         unavailable=unavailable,
+        fixed=fixed,
         holidays=holiday_dates,
         min_rest_minutes=min_rest_minutes,
         time_limit_seconds=time_limit_seconds,
     )
 
 
-def save_solution(schedule, solution):
-    """Replace the schedule's assignments and unfilled slots with the solution."""
+def save_solution(schedule, solution, *, keep_manual=True):
+    """Replace the schedule's generated assignments and unfilled slots.
+
+    With keep_manual, manually edited assignments stay untouched.
+    """
     with transaction.atomic():
-        schedule.assignments.all().delete()
+        old = schedule.assignments.all()
+        if keep_manual:
+            old = old.filter(is_manual=False)
+        old.delete()
         schedule.unfilled_slots.all().delete()
+
+        kept = set(
+            schedule.assignments.values_list("employee_id", "date", "shift_type_id")
+        )
         ShiftAssignment.objects.bulk_create(
             [
                 ShiftAssignment(
@@ -188,6 +221,7 @@ def save_solution(schedule, solution):
                     date=a.day,
                 )
                 for a in solution.assignments
+                if (a.employee_id, a.day, a.shift_id) not in kept
             ]
         )
         UnfilledSlot.objects.bulk_create(
@@ -209,6 +243,7 @@ def save_solution(schedule, solution):
 def generate_schedule(
     schedule,
     *,
+    keep_manual=True,
     min_rest_minutes=DEFAULT_MIN_REST_MINUTES,
     time_limit_seconds=10.0,
 ):
@@ -217,11 +252,22 @@ def generate_schedule(
         raise ValidationError(_("Only draft schedules can be generated."))
     problem = build_problem(
         schedule,
+        keep_manual=keep_manual,
         min_rest_minutes=min_rest_minutes,
         time_limit_seconds=time_limit_seconds,
     )
     # Solve outside the transaction so the database is not locked meanwhile.
     # If the solver fails, nothing is deleted.
     solution = solve(problem)
-    save_solution(schedule, solution)
+    save_solution(schedule, solution, keep_manual=keep_manual)
     return solution
+
+
+def check_schedule(schedule, *, min_rest_minutes=DEFAULT_MIN_REST_MINUTES):
+    """Return the rule violations of the schedule's current assignments."""
+    problem = build_problem(schedule, keep_manual=False, min_rest_minutes=min_rest_minutes)
+    assignments = [
+        Assignment(employee_id=a.employee_id, day=a.date, shift_id=a.shift_type_id)
+        for a in schedule.assignments.all()
+    ]
+    return check_assignments(problem, assignments)
